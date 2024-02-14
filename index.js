@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 var jwt = require('jsonwebtoken');
 require('dotenv').config()
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY)
 
 const port = 5000 || process.env.PORT
 const app = express();
@@ -51,6 +52,7 @@ async function run() {
         const userCollection = client.db('kutumbari').collection('users');
         const reviewCollection = client.db('kutumbari').collection('reviews');
         const cartCollection = client.db('kutumbari').collection('carts');
+        const paymentCollection = client.db('kutumbari').collection('payment');
         //jwt token
         app.post('/jwt', (req, res) => {
             const user = req.body;
@@ -89,15 +91,20 @@ async function run() {
         })
         app.get('/users/admin/:email', verifyToken, async (req, res) => {
             const email = req.params.email;
-            if (req.decoded.email !== email) {
-                res.send({ admin: false })
+
+            if (email !== req.decoded.email) {
+                return res.status(403).send({ message: 'forbidden access' })
             }
+
             const query = { email: email };
             const user = await userCollection.findOne(query);
-            const result = { admin: user?.role === 'admin' };
-            res.send(result);
+            let admin = false;
+            if (user) {
+                admin = user?.role === 'admin';
+            }
+            res.send({ admin });
         })
-        app.patch('/users/admin/:id', async (req, res) => {
+        app.patch('/users/admin/:id', verifyToken, verifyAdmin, async (req, res) => {
             const id = req.params.id;
 
             const filter = { _id: new ObjectId(id) };
@@ -160,6 +167,39 @@ async function run() {
             const result = await menuCollection.deleteOne(query);
             res.send(result);
         })
+        //payment
+        app.post("/create-payment-intent", async (req, res) => {
+            const { price } = req.body;
+            const amount = parseInt(price * 100)
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: amount,
+                currency: 'usd',
+                payment_method_types: ['card']
+            });
+            res.send({
+                clientSecret: paymentIntent.client_secret
+            })
+        })
+        app.post('/payments', async (req, res) => {
+            const payment = req.body;
+            const paymentResult = await paymentCollection.insertOne(payment);
+            console.log('payment info', payment);
+            const query = {
+                _id: {
+                    $in: payment.cartId.map(id => new ObjectId(id))
+                }
+            }
+            const deleteResult = await cartCollection.deleteMany(query)
+            res.send({ paymentResult, deleteResult });
+        })
+        app.get('/payment/:email', verifyToken, async (req, res) => {
+            const query = { email: req.params.email };
+            if (req.params.email !== req.decoded.email) {
+                return res.status(403).send({ message: 'Forbidden access' })
+            }
+            const result = await paymentCollection.find(query).toArray();
+            res.send(result);
+        })
         //reviews
         app.get('/reviews', async (req, res) => {
             const result = await reviewCollection.find().toArray();
@@ -201,7 +241,62 @@ async function run() {
             const result = await cartCollection.deleteOne(query);
             res.send(result);
         })
+        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
+            const users = await userCollection.estimatedDocumentCount();
+            const menuItem = await menuCollection.estimatedDocumentCount();
+            const order = await paymentCollection.estimatedDocumentCount();
 
+            const result = await paymentCollection.aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalRevenue: {
+                            $sum: '$price'
+                        }
+                    }
+                }
+            ]).toArray()
+            const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+            res.send({ users, menuItem, order, revenue });
+        })
+        //use aggregate pipeline
+        app.get('/order-stats', async (req, res) => {
+            const result = await paymentCollection.aggregate([
+                { $unwind: '$menuItemId' },
+                {
+                    $lookup: {
+                        from: 'menu',
+                        localField: 'menuItemId',
+                        foreignField: '_id',
+                        as: 'menuItems'
+                    }
+                },
+                {
+                    $unwind: '$menuItems'
+                },
+                {
+                    $group: {
+                        _id: '$menuItems.category',
+                        quantity: {
+                            $sum: 1
+                        },
+                        revenue: {
+                            $sum: '$menuItems.price'
+                        }
+                    }
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        category: '$_id',
+                        quantity: '$quantity',
+                        revenue: '$revenue'
+                    }
+                }
+            ]).toArray()
+            res.send(result)
+        })
         // Send a ping to confirm a successful connection
         await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
