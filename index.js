@@ -298,6 +298,13 @@ async function run() {
             ]).toArray()
             res.send(result)
         })
+        //user stats
+        app.get('/user-stats/:email', async (req, res) => {
+            const query = { email: req.params.email };
+            const order = await paymentCollection.find(query).toArray();
+            const review = await reviewCollection.find(query).toArray();
+            res.send({ order, review });
+        })
         // Send a ping to confirm a successful connection
         // await client.db("admin").command({ ping: 1 });
         // console.log("Pinged your deployment. You successfully connected to MongoDB!");
